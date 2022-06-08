@@ -1,0 +1,289 @@
+---
+title: "Car scraping"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(rvest)
+library(tidymodels)
+library(lubridate)
+library(patchwork)
+theme_set(theme_bw(base_size = 8))
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+```
+
+## Objective
+
+In this markdown document, I have documented my scraper for electric cars. Because of my interest in electric cars (especially the amazing Polestar 2), I decided to estimate second-hand prices based on data available on autoscout24.nl. On this site, second-hand electric cars are added each day, and this scraping program will collect new data of these cars each day and update a machine-learning algorithm to estimate the price based on its characteristics.  
+
+Each day, the file "newest_electric_car_data.Rds" is updated with the latest data on new car prices. This dataset thus becomes larger each day.
+
+```{r load the data}
+# load the latest data
+car_data <- readRDS("./newest_electric_car_data.Rds")
+```  
+
+For each page of electric cars, we will scrape the available data (sorted by new cars). We can only access the latest 20 pages.
+
+``` {r scrape data}
+# make an empty list
+temp <- list()
+
+# paste the url where we sort by electric cars, the page numbers increase by adding to "page="
+url <- "https://www.autoscout24.nl/lst?sort=standard&desc=0&cy=NL&atype=C&ustate=N%2CU&fuel=E&powertype=kw&page="
+
+for (i in 1:20) {
+  
+  skip_to_next <- FALSE
+  # read the html page and loop through the page number 'i'
+  data <- read_html(paste0(url, i))
+  # scrape the available data about car, model, price, mileage, registration, type and transmission
+  tryCatch(
+    page <-
+    tibble(
+      car = data %>% html_elements("h2") %>% html_text2() %>% .[1:20],
+      model = data %>% html_elements("[class='ListItem_version__jNjur']") %>% html_text2(),
+      price = data %>% html_elements("[data-testid='regular-price']") %>% html_text2(),
+      btw = data %>% html_elements("[class='css-18pqqux e1nn32ff3']") %>% html_text2(),
+      mileage = data %>% html_elements("[type='mileage']") %>% html_text2(),
+      first_registration = data %>% html_elements("[type='registrationDate']") %>% html_text2(),
+      type = data %>% html_elements("[type='offerType']") %>% html_text2(),
+      transmission = data %>% html_elements("[type='transmissionType']") %>% html_text2(),
+      owners = data %>% html_elements("[type='previousOwners']") %>% html_text2(),
+      power = data %>% html_elements("[type='power']") %>% html_text2()
+    ), 
+    error = function(e) { skip_to_next <<- TRUE}) # loop to catch error, if so, continue to next page
+  
+  if(skip_to_next) { next } # skip if error is introduced
+  
+  temp[[i]] <- page # save the data of the page to the temp-list
+}
+
+# combine all pages into a list and add the access date
+temp <- do.call(bind_rows, temp) %>%
+  mutate(date_accessed = Sys.Date()) %>%
+  drop_na()
+```
+
+We can then append the newly scraped data with the whole dataset:
+
+```{r save the newest data}
+# update the data file and keep only distinct cars
+car_data <- bind_rows(car_data, temp) %>%
+  distinct()
+
+# save the new dataframe
+saveRDS(car_data, "./newest_electric_car_data.Rds")
+```
+
+The data needs to be cleaned before we can use a machine learning model:
+
+```{r clean data}
+# clean the latest data and clean
+cars_cleaned <- 
+  car_data %>%
+  rename(info = model) %>%
+  separate(car, into = c("brand", "model"), sep = " ", extra = "merge") %>%
+  mutate(first_registration = my(first_registration),
+         mileage = parse_number(mileage, locale = locale(decimal_mark = ",")), # make mileage a number
+         price = parse_number(price, locale = locale(decimal_mark = ",")), # make price a number
+         price = if_else(btw == "Excl. BTW", price*1.21, price),
+         owners = parse_number(owners), # make number of owners a number
+         owners = if_else(is.na(owners), 0, owners)) %>%
+  rename(age = first_registration) %>%
+  mutate(age = as.numeric(Sys.Date() - age), # calculate the age in days of the car
+         polestar = case_when(brand == "Polestar" ~ "yes", # check if the car is a Polestar
+                              TRUE ~ "no")) %>%
+  separate(power, into = c("kw", "pk"), sep = "kW") %>%
+  mutate(kw = parse_number(kw),
+         pk = parse_number(pk)) %>%
+  filter(age > 0 & age < 8*365) %>% # sometimes the age is incorrect, I will only consider cars between 0 and 8 years
+  drop_na()
+
+# we will model with the data from before and predict on today's data
+cars <- cars_cleaned %>%
+  filter(date_accessed != Sys.Date()) # remove today's cars
+
+``` 
+
+#### GLM
+
+A glm-model seems to work very well for this dataset:
+
+```{r spend data budget}
+# I will split the data in training and testing
+set.seed(123)
+car_split <- initial_split(cars, strata = brand)
+car_test <- testing(car_split)
+car_train <- training(car_split)
+
+# I use 10-fold cross-validation
+set.seed(234)
+car_folds <- vfold_cv(car_train)
+```
+
+I will define and tune the model here:
+
+```{r glm model}
+# define the model parameters
+glmnet_recipe <- 
+  recipe(formula = price ~ brand + model + mileage + age + type + 
+    transmission + owners + kw + pk, data = car_train) %>% 
+  step_string2factor(all_nominal()) %>% 
+  step_novel(all_nominal(), -all_outcomes()) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_normalize(all_predictors()) %>%
+  #step_log(price, base = 10) %>%
+  step_zv(all_predictors())
+
+# set the model to glm and use regression mode for the price
+glmnet_spec <- 
+  linear_reg(penalty = tune(), mixture = tune()) %>% 
+  set_mode("regression") %>% 
+  set_engine("glmnet") 
+
+# combine recipe and model specification in a workflow
+glmnet_workflow <- 
+  workflow() %>% 
+  add_recipe(glmnet_recipe) %>% 
+  add_model(glmnet_spec) 
+
+# the grid defines the search parameters which the model will look at
+glmnet_grid <- tidyr::crossing(penalty = 10^seq(-6, -1, length.out = 20), mixture = c(0.01, 0.05, 
+    0.2, 0.4, 0.6, 0.8, 1)) 
+
+# use parallel processing and tune the model and validate on the resamples
+doParallel::registerDoParallel()
+set.seed(1234)
+
+glmnet_tune <- 
+  tune_grid(glmnet_workflow, 
+            resamples = car_folds, 
+            grid = glmnet_grid)
+```
+
+Now we have a model, we will choose the best hyperparameters and plot the model
+
+```{r finalize glm-model}
+# these are the different hyperparameter models
+glmnet_tune %>%
+  collect_metrics() %>%
+  filter(.metric == "rmse") %>%
+  select(mean, penalty, mixture) %>%
+  pivot_longer(penalty:mixture,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "rmse")
+
+# finalize workflow and choose the parameters with the lowest rmse
+glmnet_workflow <-
+  finalize_workflow(glmnet_workflow,
+                    select_best(glmnet_tune, metric = "rmse"))
+
+# fit the model one final time on the testing set
+glmnet_res <- last_fit(glmnet_workflow, car_split)
+
+# now we will plot the predictions
+glm_plot <- collect_predictions(glmnet_res) %>%
+  ggplot(aes(price, .pred)) +
+  geom_point(alpha = .5, color = "midnightblue") +
+  geom_abline(lty = 2, size = 1.5) +
+  coord_fixed() +
+  scale_x_continuous(labels = scales::dollar_format(prefix = "€"), 
+                     breaks = scales::pretty_breaks(),
+                     limits = c(0, 100000),
+                     expand = c(0,0)) +
+  scale_y_continuous(labels = scales::dollar_format(prefix = "€"), 
+                     breaks = scales::pretty_breaks(),
+                     limits = c(0,100000),
+                     expand = c(0,0)) +
+  geom_text(aes(label = paste("n: ", car_train %>% nrow(),
+                              "\nRMSE:", collect_metrics(glmnet_res) %>% 
+                                pull(.estimate) %>% .[1] %>% round(digits = 0),
+                              "\nR-squared:", collect_metrics(glmnet_res) %>% 
+                                pull(.estimate) %>% .[2] %>% round(digits = 2)), 
+                x = 25000, y = 85000), size = 3) +
+  theme(plot.margin = margin(1, 1, 1, 0, "cm")) +
+  labs(x = "Asking price", y = "Predicted price",
+       title = paste("Model as of", Sys.Date()),
+       caption = "Data scraped from Autoscout24 by Jasper")
+
+# extract and save the final model of today
+glmnet_model <- glmnet_res %>% extract_workflow()
+saveRDS(glmnet_model, paste0("./Models/glm_model_", Sys.Date(), ".Rds"))
+```
+
+Now we have a final model, we can see what factors drive the prediction most towards lower or higher prices. This is very straightforward for a linear model.
+
+```{r What drives the model?}
+model_driver <-
+  glmnet_model %>%
+  tidy() %>%
+  filter(term != "(Intercept)") %>%
+  group_by(estimate > 0) %>%
+  slice_max(abs(estimate), n = 15) %>%
+  ungroup() %>%
+  ggplot(aes(estimate, fct_reorder(term, estimate), fill = estimate > 0)) +
+  geom_col(alpha = 0.8) +
+  scale_fill_manual(labels = c("lower price", "higher price"),
+                      values = c("violetred3", "forestgreen")) +
+  labs(title = "What drives the linear model?", y = NULL, fill = "Causes...")
+```
+
+Now that we have a model, the most important thing is to use the model to predict the prices of today's cars!
+
+```{r predict new prices}
+# select only the new cars of today
+car_new <- cars_cleaned %>%
+  filter(date_accessed == Sys.Date())
+
+# plot the predictions
+new_plot <-
+  augment(glmnet_model, car_new) %>% # predict the prices with the model
+  ggplot(aes(price, .pred)) +
+  geom_point(aes(color = polestar), alpha = .5) +
+  geom_abline(lty = 2, size = 1.5) +
+  coord_fixed() +
+  scale_color_manual(values = c("gray50", "red")) +
+  scale_x_continuous(labels = scales::dollar_format(prefix = "€"), 
+                     breaks = scales::pretty_breaks(),
+                     limits = c(0,100000),
+                     expand = c(0,0)) +
+  scale_y_continuous(labels = scales::dollar_format(prefix = "€"), 
+                     breaks = scales::pretty_breaks(),
+                     limits = c(0,100000),
+                     expand = c(0,0)) +
+  geom_text(
+    aes(
+      label = paste("n: ", car_new %>% nrow(),
+                    "\nmean: €", augment(glmnet_model, car_new) %>% 
+                      summarise(mean = mean(price)) %>% round(0),
+                    "\nRMSE:",metrics(augment(glmnet_model, car_new), price, .pred) %>% 
+                      filter(.metric == "rmse") %>% pull(.estimate) %>% round(0),
+                    "\nR-squared:", metrics(augment(glmnet_model, car_new), price, .pred) %>%
+                      filter(.metric == "rsq") %>% pull(.estimate) %>% round(2)), 
+      x = 25000, y = 85000), size = 3) +
+  labs(x = "Asking price", y = "Predicted price",
+       color = "Polestar?",
+       title = paste("New predicted prices", Sys.Date()),
+       caption = "Data scraped from Autoscout24 by Jasper")
+
+```
+
+The model seems to be able to predict prices of electric cars very well when the price is less than 40.000 euro. Upwards of this price, the specifications of the car are the main drivers of price and these extra car features cannot be added into the model with this limited data scraped from autoscout24.
+
+We will save a graph of today's results.
+
+```{r save graphs of today's model}
+glm_plot / model_driver / new_plot + plot_annotation(tag_levels = 'A')
+
+ggsave(paste0("./Model graphs/Model_", Sys.Date(), ".pdf"), width = 5.4, height = 10)
+```
+
