@@ -47,7 +47,7 @@ for (i in 1:20) {
       car = data %>% html_elements("h2") %>% html_text2() %>% .[1:20],
       model = data %>% html_elements("[class='ListItem_version__jNjur']") %>% html_text2(),
       price = data %>% html_elements("[data-testid='regular-price']") %>% html_text2(),
-      btw = data %>% html_elements("[class='css-18pqqux e1nn32ff3']") %>% html_text2(),
+      #btw = data %>% html_elements("[class='css-18pqqux e1nn32ff3']") %>% html_text2(),
       mileage = data %>% html_elements("[type='mileage']") %>% html_text2(),
       first_registration = data %>% html_elements("[type='registrationDate']") %>% html_text2(),
       type = data %>% html_elements("[type='offerType']") %>% html_text2(),
@@ -88,11 +88,17 @@ cars_cleaned <-
   rename(info = model) %>%
   separate(car, into = c("brand", "model"), sep = " ", extra = "merge") %>%
   mutate(first_registration = my(first_registration),
+         mileage = case_when(mileage == "- km" ~ "0", 
+                             TRUE ~ mileage),
          mileage = parse_number(mileage, locale = locale(decimal_mark = ",")), # make mileage a number
          price = parse_number(price, locale = locale(decimal_mark = ",")), # make price a number
-         price = if_else(btw == "Excl. BTW", price*1.21, price),
-         owners = parse_number(owners), # make number of owners a number
-         owners = if_else(is.na(owners), 0, owners)) %>%
+         price_incl = str_remove_all(info, "[[:punct:]]"),
+         price_incl = parse_number(str_extract(price_incl, "[0-9]{5}")),
+         price_incl = ifelse(is.na(price_incl), 0, price_incl),
+         price = if_else(price_incl > price & price_incl < 1.3 * price, price_incl, price),
+         owners = case_when(owners == "- (Vorige eigenaren)" ~ "0",
+                            TRUE ~ owners),
+         owners = parse_number(owners)) %>% # make number of owners a number
   rename(age = first_registration) %>%
   mutate(age = as.numeric(Sys.Date() - age), # calculate the age in days of the car
          polestar = case_when(brand == "Polestar" ~ "yes", # check if the car is a Polestar
@@ -101,6 +107,7 @@ cars_cleaned <-
   mutate(kw = parse_number(kw),
          pk = parse_number(pk)) %>%
   filter(age > 0 & age < 8*365) %>% # sometimes the age is incorrect, I will only consider cars between 0 and 8 years
+  filter(price > 5000) %>%
   drop_na()
 
 # we will model with the data from before and predict on today's data
@@ -269,7 +276,7 @@ new_plot <-
                       filter(.metric == "rmse") %>% pull(.estimate) %>% round(0),
                     "\nR-squared:", metrics(augment(glmnet_model, car_new), price, .pred) %>%
                       filter(.metric == "rsq") %>% pull(.estimate) %>% round(2)), 
-      x = 25000, y = 85000), size = 3) +
+      x = 25000, y = 80000), size = 3) +
   labs(x = "Asking price", y = "Predicted price",
        color = "Polestar?",
        title = paste("New predicted prices", Sys.Date()),
